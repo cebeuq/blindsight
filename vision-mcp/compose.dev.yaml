@@ -1,0 +1,42 @@
+# vision-mcp dev tasks. NOT the deployment (the top-level compose.yaml owns the vision-mcp service).
+# Paths below are relative to this directory; from the repo root add -f vision-mcp/compose.dev.yaml.
+#   Tests:  docker compose -f compose.dev.yaml run --rm --build test     (no network: the vision model is a local stub)
+#   Relock: docker compose -f compose.dev.yaml run --rm lock             (requirements.in -> hashed requirements.txt)
+#   Smoke:  docker compose -f compose.dev.yaml up -d --build serve        (runtime image on 127.0.0.1:8102, empty tmpfs
+#           store, vision model unreachable unless VISION_BASE_URL is set) ... docker compose -f compose.dev.yaml down
+name: blindsight-vision-mcp-dev
+services:
+  test:
+    build: { context: ., target: test }
+    image: blindsight-vision-mcp:test
+    restart: "no"
+    network_mode: none
+    read_only: true
+    tmpfs: [ /tmp ]
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 256
+  serve:
+    build: { context: ., target: runtime }
+    image: blindsight-vision-mcp:dev
+    restart: "no"
+    read_only: true
+    tmpfs: [ /tmp, /store ]
+    environment:
+      VISION_BASE_URL: "${VISION_BASE_URL:-http://127.0.0.1:9}"
+      VISION_MODEL: "${VISION_MODEL:-dev-placeholder}"
+    ports: [ "127.0.0.1:8102:8102" ]
+    mem_limit: 1536m
+    cpus: 2
+    pids_limit: 256
+    stop_grace_period: 10s
+    logging: { driver: local, options: { max-size: "20m", max-file: "3" } }
+  lock:
+    image: ghcr.io/astral-sh/uv:0.13.0-python3.14-trixie-slim@sha256:8e70ac2e85d09a5bb7ef09753b80671a60a71c8d24f195e4890d71e03865e36d
+    restart: "no"
+    working_dir: /src
+    volumes: [ "./:/src" ]
+    environment: { UV_CACHE_DIR: /tmp/uv-cache }
+    tmpfs: [ /tmp ]
+    command: [ uv, pip, compile, requirements.in, --universal, --python-version, "3.14", --generate-hashes,
+               --no-header, --quiet, -o, requirements.txt ]

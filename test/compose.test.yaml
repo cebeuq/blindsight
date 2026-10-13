@@ -1,0 +1,53 @@
+# Stack test overlay (never deploy). Run via test/run.sh: project blindsight-test, every variable set there.
+# The blindsight network becomes INTERNAL (no outside access) and gains a stub that plays both models: the text model
+# on stub:8000 and the vision model on stub:8001 (run.sh points TEXT_HOST / VISION_BASE_URL at it). Nothing is
+# published on the host, and the images get test-only tags so a deployed stack's images are never replaced.
+# Paths are relative to the project directory (the repo root, i.e. the first -f file).
+services:
+  router:
+    ports: !reset []
+    depends_on: { stub: { condition: service_healthy } }   # HAProxy resolves TEXT_HOST=stub once, at startup
+  imgfix:
+    image: blindsight-test-imgfix:local
+  vision-mcp:
+    image: blindsight-test-vision-mcp:local
+    ports: !reset []
+
+  stub:
+    image: python:3.14.8-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+    restart: "no"
+    read_only: true
+    user: "65534:65534"
+    command: [ python, -I, /test/stub.py ]
+    volumes: [ "./test/stub.py:/test/stub.py:ro" ]
+    networks: [ blindsight ]
+    mem_limit: 512m                                 # holds one ~34 MiB recorded body (big-body check)
+    cpus: 1
+    pids_limit: 64
+    stop_grace_period: 5s
+    logging: { driver: local, options: { max-size: "20m", max-file: "3" } }
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request as u; [u.urlopen(f'http://127.0.0.1:{p}/health', timeout=2) for p in (8000, 8001)]" ]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  driver:
+    image: blindsight-test-vision-mcp:local         # built by the vision-mcp service; has Pillow
+    profiles: [ driver ]
+    restart: "no"
+    read_only: true
+    command: [ python, -I, /test/driver.py, phase1 ]
+    environment:                                    # what the driver expects the services to send to the stub
+      VISION_MODEL: ${VISION_MODEL:?run via test/run.sh}
+      VISION_API_KEY: ${VISION_API_KEY:?run via test/run.sh}
+      VISION_EXTRA_BODY: ${VISION_EXTRA_BODY:?run via test/run.sh}
+    volumes: [ "./test/driver.py:/test/driver.py:ro" ]
+    networks: [ blindsight ]
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 64
+
+networks:
+  blindsight:
+    internal: true

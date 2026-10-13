@@ -1,0 +1,14 @@
+# imgfix dev tasks. NOT the deployment (the top-level compose.yaml owns the imgfix service).
+#   Tests: docker compose -f imgfix/compose.dev.yaml run --rm --build test   (no network: the models are local stubs)
+name: blindsight-imgfix-dev
+services:
+  test:
+    build: { context: ., target: test }
+    image: blindsight-imgfix:test
+    restart: "no"
+    network_mode: none
+    read_only: true
+    tmpfs: [ /tmp ]
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 256

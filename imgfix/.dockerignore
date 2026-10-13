@@ -1,0 +1,5 @@
+*
+!requirements.txt
+!imgfix.py
+!tests/
+tests/**/__pycache__

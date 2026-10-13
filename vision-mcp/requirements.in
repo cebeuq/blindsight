@@ -1,0 +1,5 @@
+# Direct deps of server.py. Lock with: docker compose -f compose.dev.yaml run --rm lock  (-> requirements.txt, hashed)
+mcp==2.3.0          # official MCP Python SDK (v2: MCPServer, streamable HTTP)
+pillow==12.3.0      # decode / crop / downscale, PNG out
+httpx2              # async HTTP client for the vision model (already an mcp dependency)
+uvicorn             # ASGI server (already an mcp dependency)

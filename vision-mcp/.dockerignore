@@ -1,0 +1,5 @@
+*
+!requirements.txt
+!server.py
+!tests/
+tests/**/__pycache__
