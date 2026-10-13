@@ -1,7 +1,8 @@
 """Unit tests: id validation, store lookup, region/crop math, image preparation, PDF page rendering, prompt helpers,
-configuration from the environment."""
+configuration from the environment, the access-log query filter."""
 
 import io
+import logging
 import os
 import unittest
 from pathlib import Path
@@ -11,7 +12,7 @@ from PIL import Image
 
 import server
 from server import AskError
-from tests.util import HEX, IMG_ID, PDF_ID, QUAD, Store, quad_image
+from tests.util import HEX, IMG_ID, PDF_ID, QUAD, Store, quad_image, vision
 
 
 def png(data: bytes) -> Image.Image:
@@ -218,9 +219,17 @@ class TestPdf(unittest.TestCase):
 
 
 class TestHelpers(unittest.TestCase):
-    def test_chat_url(self):
-        for base in ("http://q:8001", "http://q:8001/", "http://q:8001/v1", "http://q:8001/v1/"):
-            self.assertEqual(server.chat_url(base), "http://q:8001/v1/chat/completions")
+    def test_public_url(self):
+        self.assertEqual(server.public_url("https://u:pw@v.example:8443/v1/chat/completions?api-version=1"),
+                         "https://v.example:8443/v1/chat/completions")
+        self.assertEqual(server.public_url("http://[::1]:8001/v1/messages"), "http://[::1]:8001/v1/messages")
+
+    def test_redact(self):
+        api = vision("http://v/v1", VISION_API_KEY="sk-secret-key-1", VISION_HEADERS='{"x-org": "org-secret-9", "x-n": "1"}')
+        out = server.redact("bad key sk-secret-key-1 (Bearer sk-secret-key-1) org org-secret-9 n=1 application/json", api)
+        self.assertEqual(out, "bad key [redacted] ([redacted]) org [redacted] n=1 application/json")
+        anth = vision("http://v", VISION_API="anthropic", VISION_API_KEY="sk-ant-secret")
+        self.assertEqual(server.redact("x-api-key sk-ant-secret is invalid", anth), "x-api-key [redacted] is invalid")
 
     def test_user_prompt(self):
         t = server.user_prompt(PDF_ID, " What is the title? ", "user is debugging", 3, (0, 0, 0.5, 0.25))
@@ -235,22 +244,23 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(server.clean_answer("hmm</think>Red."), "Red.")
         self.assertEqual(server.clean_answer("  Red.  "), "Red.")
 
-    def test_request_body(self):
-        cfg = server.Config(vision_model="vision-x")
-        body = server.request_body(cfg, b"png", "prompt")
-        self.assertEqual(sorted(body), ["max_tokens", "messages", "model", "temperature"])  # nothing extra by default
-        self.assertEqual((body["model"], body["temperature"], body["max_tokens"]), ("vision-x", 0.2, 700))
-        cfg.extra_body = {"chat_template_kwargs": {"enable_thinking": False}, "max_tokens": 900,
-                          "model": "hijack", "messages": [], "stream": True}  # reserved keys never override
-        body = server.request_body(cfg, b"png", "prompt")
-        self.assertEqual((body["model"], body["max_tokens"], body["chat_template_kwargs"]),
-                         ("vision-x", 900, {"enable_thinking": False}))
-        self.assertEqual([m["role"] for m in body["messages"]], ["system", "user"])
-        self.assertNotIn("stream", body)
+    def test_request_settings(self):
+        self.assertEqual((server.TEMPERATURE, server.MAX_TOKENS), (0.2, 700))
+
+    def test_access_log_hides_query(self):
+        rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                                ("127.0.0.1:5", "GET", "/ask?image_id=x&question=secret+q", "1.1", 200), None)
+        self.assertTrue(server.HIDE_QUERY.filter(rec))
+        self.assertEqual(rec.getMessage(), '127.0.0.1:5 - "GET /ask?... HTTP/1.1" 200')
+        rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                                ("127.0.0.1:5", "POST", "/mcp", "1.1", 200), None)
+        self.assertTrue(server.HIDE_QUERY.filter(rec))
+        self.assertEqual(rec.getMessage(), '127.0.0.1:5 - "POST /mcp HTTP/1.1" 200')
 
 
-ENV_KEYS = ("VISION_MODEL", "VISION_BASE_URL", "VISION_API_KEY", "VISION_EXTRA_BODY", "VISION_TIMEOUT", "STORE_DIR",
-            "ASK_CONCURRENCY", "DECODE_CONCURRENCY", "MCP_ALLOWED_HOSTS")
+ENV_KEYS = ("VISION_API", "VISION_MODEL", "VISION_BASE_URL", "VISION_API_KEY", "VISION_HEADERS", "VISION_TOKEN_PARAM",
+            "VISION_EXTRA_BODY", "VISION_TIMEOUT", "STORE_DIR", "ASK_CONCURRENCY", "DECODE_CONCURRENCY",
+            "MCP_ALLOWED_HOSTS")
 
 
 class TestConfigFromEnv(unittest.TestCase):
@@ -261,24 +271,36 @@ class TestConfigFromEnv(unittest.TestCase):
     def test_defaults(self):
         with self.env(VISION_MODEL="m"):
             cfg = server.Config.from_env()
-        self.assertEqual((cfg.store, cfg.vision_base_url, cfg.vision_model, cfg.vision_api_key, cfg.vision_timeout),
-                         (Path("/store"), "http://host.docker.internal:8001/v1", "m", "", 60.0))
-        self.assertEqual((cfg.extra_body, cfg.concurrency, cfg.decode_concurrency), ({}, 4, 2))
+        self.assertEqual((cfg.store, cfg.vision.kind, cfg.vision.url, cfg.vision.model, cfg.vision_timeout),
+                         (Path("/store"), "openai", "http://host.docker.internal:8001/v1/chat/completions", "m", 60.0))
+        self.assertEqual(cfg.vision.headers, {"content-type": "application/json"})  # no key -> no auth header
+        self.assertEqual((cfg.vision.extra, cfg.concurrency, cfg.decode_concurrency), ({}, 4, 2))
         self.assertEqual(cfg.allowed_hosts, ["127.0.0.1:*", "localhost:*", "vision-mcp:*"])
 
     def test_values(self):
         with self.env(VISION_MODEL=" m2 ", VISION_BASE_URL="https://v.example/v1", VISION_API_KEY=" sk-1 ",
                       VISION_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}', VISION_TIMEOUT="5",
-                      MCP_ALLOWED_HOSTS="a:*, b:1 ,"):
+                      ASK_CONCURRENCY="3", DECODE_CONCURRENCY=" 1 ", MCP_ALLOWED_HOSTS="a:*, b:1 ,"):
             cfg = server.Config.from_env()
-        self.assertEqual((cfg.vision_model, cfg.vision_base_url, cfg.vision_api_key, cfg.vision_timeout),
-                         ("m2", "https://v.example/v1", "sk-1", 5.0))
-        self.assertEqual(cfg.extra_body, {"chat_template_kwargs": {"enable_thinking": False}})
+        self.assertEqual((cfg.vision.model, cfg.vision.url, cfg.vision.headers["authorization"], cfg.vision_timeout),
+                         ("m2", "https://v.example/v1/chat/completions", "Bearer sk-1", 5.0))
+        self.assertEqual(cfg.vision.extra, {"chat_template_kwargs": {"enable_thinking": False}})
+        self.assertEqual((cfg.concurrency, cfg.decode_concurrency), (3, 1))
         self.assertEqual(cfg.allowed_hosts, ["a:*", "b:1"])
         line = server.describe(cfg)
-        self.assertIn("api_key=set", line)
+        self.assertEqual(line, "store=/store api=openai url=https://v.example/v1/chat/completions model=m2 auth=set "
+                               "headers=authorization extra_body_keys=chat_template_kwargs allowed_hosts=a:*,b:1")
         self.assertNotIn("sk-1", line)  # the key is never logged
-        self.assertIn("vision=https://v.example/v1/chat/completions", line)
+
+    def test_anthropic_and_headers(self):
+        with self.env(VISION_MODEL="claude-x", VISION_API="anthropic", VISION_API_KEY="sk-ant-1",
+                      VISION_HEADERS='{"anthropic-beta": "b1"}', VISION_TOKEN_PARAM="max_completion_tokens"):
+            cfg = server.Config.from_env()
+        self.assertEqual((cfg.vision.kind, cfg.vision.url, cfg.vision.token_param),
+                         ("anthropic", "https://api.anthropic.com/v1/messages", "max_tokens"))
+        self.assertEqual(cfg.vision.headers, {"content-type": "application/json", "anthropic-version": "2023-06-01",
+                                              "x-api-key": "sk-ant-1", "anthropic-beta": "b1"})
+        self.assertNotIn("sk-ant-1", server.describe(cfg))
 
     def test_allowed_hosts_off_only_with_star(self):
         for value, want in (("*", []), (" * ", []), ("", ["127.0.0.1:*", "localhost:*", "vision-mcp:*"]),
@@ -288,9 +310,18 @@ class TestConfigFromEnv(unittest.TestCase):
 
     def test_errors(self):
         for kv, msg in (({}, "VISION_MODEL is not set"), ({"VISION_MODEL": "  "}, "VISION_MODEL is not set"),
-                        ({"VISION_MODEL": "m", "VISION_EXTRA_BODY": "{bad"}, "VISION_EXTRA_BODY is not valid JSON"),
-                        ({"VISION_MODEL": "m", "VISION_EXTRA_BODY": "[]"}, "must be a JSON object"),
-                        ({"VISION_MODEL": "m", "VISION_EXTRA_BODY": '{"model":"x"}'}, "may not set model")):
+                        ({"VISION_EXTRA_BODY": "{bad"}, "VISION_EXTRA_BODY is not valid JSON"),
+                        ({"VISION_EXTRA_BODY": "[]"}, "must be a JSON object"),
+                        ({"VISION_EXTRA_BODY": '{"model":"x"}'}, "may not set model"),
+                        ({"VISION_API": "gemini"}, "VISION_API must be one of"),
+                        ({"VISION_BASE_URL": "vlm:8001"}, "VISION_BASE_URL must be an http"),
+                        ({"VISION_HEADERS": '{"x": 1}'}, "VISION_HEADERS"),
+                        ({"VISION_TOKEN_PARAM": "tokens"}, "VISION_TOKEN_PARAM must be one of"),
+                        ({"VISION_TIMEOUT": "soon"}, "VISION_TIMEOUT must be a positive number"),
+                        ({"VISION_TIMEOUT": "0"}, "VISION_TIMEOUT must be a positive number"),
+                        ({"ASK_CONCURRENCY": "1.5"}, "ASK_CONCURRENCY must be a positive number"),
+                        ({"DECODE_CONCURRENCY": "-1"}, "DECODE_CONCURRENCY must be a positive number")):
+            kv = {"VISION_MODEL": "m", **kv} if kv else kv
             with self.env(**kv), self.assertRaisesRegex(server.ConfigError, msg, msg=kv):
                 server.Config.from_env()
 

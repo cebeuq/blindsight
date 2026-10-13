@@ -1,4 +1,5 @@
-"""Shared test helpers: a temp /store, test images/PDFs, a recording vision-model stub, and the server on a free port."""
+"""Shared test helpers: a temp /store, test images/PDFs, a recording vision-model stub (OpenAI or Anthropic format),
+and the server on a free port."""
 
 import io
 import json
@@ -9,10 +10,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import uvicorn
 from PIL import Image
 
 import server
+import vision_api
 
 HEX = "0123456789abcdef"
 IMG_ID = "img_" + HEX
@@ -67,23 +68,49 @@ def decode_png_data_url(url: str) -> Image.Image:
     return im
 
 
-class VisionStub:
-    """Minimal OpenAI-compatible chat/completions endpoint that records every request body."""
+def vision(url: str, **env: str) -> "vision_api.VisionAPI":
+    """VisionAPI for a stub at url, built the way the server builds it (from VISION_* settings)."""
+    return vision_api.from_env({"VISION_BASE_URL": url, "VISION_MODEL": "test-vision-model", **env})
 
-    def __init__(self, answer: str = "The dialog says \"Disk full\".", status: int = 200):
-        self.answer, self.status, self.requests = answer, status, []
+
+class VisionStub:
+    """Minimal vision endpoint (OpenAI chat/completions or Anthropic messages reply shape, per api; "raw": the answer as
+    a non-JSON body) that records every request. stop: the finish/stop reason sent; delay: seconds to wait before answering; inflight / max_inflight:
+    concurrent requests now / at most."""
+
+    def __init__(self, answer: str = "The dialog says \"Disk full\".", status: int = 200, api: str = "openai"):
+        self.answer, self.status, self.api, self.requests = answer, status, api, []
+        self.stop, self.delay, self.error_text = None, 0.0, "stub failure"
+        self.inflight = self.max_inflight = 0
+        self._lock = threading.Lock()
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                stub.requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
-                if stub.status == 200:
-                    out = {"id": "x", "object": "chat.completion", "model": body.get("model"),
-                           "choices": [{"index": 0, "message": {"role": "assistant", "content": stub.answer}, "finish_reason": "stop"}]}
+                with stub._lock:
+                    stub.requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
+                    stub.inflight += 1
+                    stub.max_inflight = max(stub.max_inflight, stub.inflight)
+                try:
+                    time.sleep(stub.delay)
+                finally:
+                    with stub._lock:
+                        stub.inflight -= 1
+                if stub.api == "raw":  # answer as the raw (non-JSON) body
+                    out = None
+                elif stub.status != 200:
+                    out = {"error": {"message": stub.error_text, "code": stub.status}}
+                elif stub.api == "anthropic":
+                    out = {"id": "msg_x", "type": "message", "role": "assistant", "model": body.get("model"),
+                           "content": [{"type": "thinking", "thinking": "hmm", "signature": "s"},
+                                       {"type": "text", "text": stub.answer}],
+                           "stop_reason": stub.stop or "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}
                 else:
-                    out = {"error": {"message": "stub failure", "code": stub.status}}
-                data = json.dumps(out).encode()
+                    out = {"id": "x", "object": "chat.completion", "model": body.get("model"),
+                           "choices": [{"index": 0, "message": {"role": "assistant", "content": stub.answer},
+                                        "finish_reason": stub.stop or "stop"}]}
+                data = stub.answer.encode() if out is None else json.dumps(out).encode()
                 self.send_response(stub.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -96,6 +123,11 @@ class VisionStub:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def reset(self, answer: str, api: str = "openai"):
+        self.requests.clear()
+        self.answer, self.api, self.status, self.stop, self.delay, self.error_text = answer, api, 200, None, 0.0, "stub failure"
+        self.max_inflight = 0
 
     def close(self):
         self.httpd.shutdown()
@@ -112,14 +144,15 @@ def closed_port_url() -> str:
 
 
 class RunningServer:
-    """server.build_app(cfg) under uvicorn in a background thread, on a pre-bound free port."""
+    """server.build_app(cfg) under uvicorn (set up like production: server.uvicorn_server) in a background thread, on a
+    pre-bound free port."""
 
     def __init__(self, cfg: "server.Config"):
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
         self.url = f"http://127.0.0.1:{self.port}"
-        self.uv = uvicorn.Server(uvicorn.Config(server.build_app(cfg), log_level="warning", lifespan="on"))
+        self.uv = server.uvicorn_server(cfg, log_level="warning", lifespan="on")
         self.thread = threading.Thread(target=self.uv.run, kwargs={"sockets": [self.sock]}, daemon=True)
         self.thread.start()
         deadline = time.monotonic() + 10

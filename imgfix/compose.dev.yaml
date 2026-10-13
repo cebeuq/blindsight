@@ -3,7 +3,10 @@
 name: blindsight-imgfix-dev
 services:
   test:
-    build: { context: ., target: test }
+    build:
+      context: .
+      target: test
+      additional_contexts: { shared: ../shared }   # vision_api.py (COPY --from=shared)
     image: blindsight-imgfix:test
     restart: "no"
     network_mode: none

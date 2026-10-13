@@ -17,6 +17,7 @@ from unittest import mock
 from PIL import Image
 
 import imgfix
+import vision_api
 from . import helpers as h
 
 PLACEHOLDER = re.compile(r'^\[image (img_[0-9a-f]{16}) \| (\d+)x(\d+) (png|jpg|gif|webp) \| ([^\n]*)\] The model cannot '
@@ -46,7 +47,9 @@ class FakeCaptioner:
             self.active -= 1
 
 
-class RewriteTest(unittest.TestCase):
+class StoreCase(unittest.TestCase):
+    """Fresh store per test + helpers (no tests of its own; other modules subclass it)."""
+
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="imgfix-test-")
         self.store = imgfix.Store(self.dir)
@@ -77,6 +80,8 @@ class RewriteTest(unittest.TestCase):
         with open(os.path.join(self.dir, "meta", mid + ".json")) as f:
             return json.load(f)
 
+
+class RewriteTest(StoreCase):
     # ------------------------------------------------------------ images
 
     def test_user_image(self):
@@ -150,15 +155,24 @@ class RewriteTest(unittest.TestCase):
         bad = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "!!!not base64!!!"}},
                h.image_block(b"definitely not an image"),
                h.image_block(h.noise_png()[:2000]),  # truncated PNG
-               {"type": "image", "source": {"type": "file", "file_id": "file_1"}},
                {"type": "image"},
-               {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": h.b64(b"%PDF-junk")}}]
+               {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": h.b64(b"%PDF-junk")}},
+               {"type": "document", "source": {"type": "base64", "media_type": "application/zip", "data": h.b64(b"PK")}}]
         res, out = self.rewritten(h.body(h.user(*bad)), FakeCaptioner())
         self.assertEqual(h.texts(out), [imgfix.UNAVAILABLE] * len(bad))
         self.assertEqual(res.stats["failed"], len(bad))
         junk = iid(b"%PDF-junk", "pdf_")  # no raw bytes are stored; the broken PDF gets a write-once "failed" meta
         self.assertEqual(self.files(), [f"meta/{junk}.json"])
         self.assertEqual((self.meta(junk)["failed"], self.meta(junk)["kind"]), (True, "pdf"))
+
+    def test_file_id_sources(self):
+        # Provider-side uploads (Anthropic Files API): the bytes are not in the request, so a fixed text says so.
+        _, out = self.rewritten(h.body(h.user({"type": "image", "source": {"type": "file", "file_id": "file_1"}},
+                                              {"type": "document", "source": {"type": "file", "file_id": "file_2"}},
+                                              {"type": "image", "source": {"type": "file"}})))
+        self.assertEqual(h.texts(out), ["[image unavailable: file_id file_1 not readable]",
+                                        "[file unavailable: file_id file_2 not readable]", imgfix.UNAVAILABLE])
+        self.assertEqual(self.files(), [])
 
     def test_oversized(self):
         with mock.patch.object(imgfix, "MAX_IMAGE_BYTES", 10):
@@ -490,7 +504,8 @@ class RewriteTest(unittest.TestCase):
         import httpx
 
         def run(choice):
-            cap = imgfix.VisionCaptioner("http://q:1", model="vision-x", extra={})
+            api = vision_api.from_env({"VISION_MODEL": "vision-x", "VISION_BASE_URL": "http://q:1"})
+            cap = imgfix.VisionCaptioner(api)
             cap.client = httpx.AsyncClient(transport=httpx.MockTransport(
                 lambda req: httpx.Response(200, json={"choices": [choice]})))
 
@@ -516,40 +531,22 @@ class RewriteTest(unittest.TestCase):
                 self.assertEqual((im.format, im.size), ("PNG", size))
 
     def test_caption_request_shape(self):
-        req = json.loads(imgfix._caption_request(h.png(2000, 100), "vision-x"))
+        api = vision_api.from_env({"VISION_MODEL": "vision-x"})
+        req = json.loads(imgfix._caption_request(h.png(2000, 100), api, "short"))
         self.assertEqual(sorted(req), ["max_tokens", "messages", "model", "temperature"])  # nothing extra by default
         self.assertEqual((req["model"], req["temperature"], req["max_tokens"]), ("vision-x", 0, 60))
         part = req["messages"][0]["content"][0]
         self.assertTrue(part["image_url"]["url"].startswith("data:image/png;base64,"))
-        self.assertEqual(imgfix.VisionCaptioner("http://q:1/v1/").url, "http://q:1/v1/chat/completions")
-        self.assertEqual(imgfix.VisionCaptioner("https://q.example/v1").url, "https://q.example/v1/chat/completions")
-        self.assertEqual(imgfix.VisionCaptioner("http://q:1").url, "http://q:1/v1/chat/completions")
+        self.assertEqual(req["messages"][0]["content"][1]["text"], imgfix.CAPTION_PROMPT)
 
     def test_caption_request_extra_body(self):
-        extra = {"chat_template_kwargs": {"enable_thinking": False}, "top_k": 20, "temperature": 0.1,
-                 "model": "hijack", "messages": [], "stream": True}  # reserved keys never override (defense in depth)
-        req = json.loads(imgfix._caption_request(h.png(20, 10), "vision-x", extra))
+        api = vision_api.from_env({"VISION_MODEL": "vision-x", "VISION_EXTRA_BODY":
+                                   '{"chat_template_kwargs":{"enable_thinking":false},"top_k":20,"temperature":0.1}'})
+        req = json.loads(imgfix._caption_request(h.png(20, 10), api, "short"))
         self.assertEqual((req["model"], req["chat_template_kwargs"], req["top_k"], req["temperature"]),
                          ("vision-x", {"enable_thinking": False}, 20, 0.1))
         self.assertEqual(len(req["messages"]), 1)
         self.assertNotIn("stream", req)
-
-    def test_captioner_auth_header(self):
-        self.assertEqual(imgfix.VisionCaptioner("http://q:1", api_key="sk-1").headers,
-                         {"content-type": "application/json", "authorization": "Bearer sk-1"})
-        self.assertNotIn("authorization", imgfix.VisionCaptioner("http://q:1", api_key="").headers)
-
-    def test_parse_extra_body(self):
-        self.assertEqual(imgfix.parse_extra_body(""), {})
-        self.assertEqual(imgfix.parse_extra_body("  {} "), {})
-        self.assertEqual(imgfix.parse_extra_body('{"chat_template_kwargs":{"enable_thinking":false}}'),
-                         {"chat_template_kwargs": {"enable_thinking": False}})
-        for bad, msg in (("{not json", "not valid JSON"), ("[1]", "must be a JSON object"),
-                         ('"x"', "must be a JSON object"), ('{"model":"x"}', "may not set model"),
-                         ('{"messages":[],"stream":true}', "may not set messages, stream")):
-            with self.assertRaisesRegex(ValueError, msg, msg=bad):
-                imgfix.parse_extra_body(bad)
-
 
 if __name__ == "__main__":
     unittest.main()

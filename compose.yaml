@@ -1,29 +1,54 @@
-# blindsight: give a text-only model behind the Anthropic Messages API "eyes".
-#   router     HAProxy, the client's API address (${BIND_ADDR}:${ROUTER_PORT}). Text-only requests go straight to the
-#              text model byte for byte; image/document-bearing (or too-big-to-check) requests go to imgfix.
-#   imgfix     mitmproxy addon (imgfix/imgfix.py): swaps each image/document block for a fixed text reference, stores
-#              the bytes in the blindsight-store volume, forwards to the text model. Internal only (no published port).
-#   vision-mcp MCP server (vision-mcp/server.py) with the ask_image tool at ${BIND_ADDR}:${MCP_PORT}/mcp: shows a
-#              stored image to the vision model and returns its answer. Reads blindsight-store read-only.
-# imgfix down => the router answers image/document requests with a 400 (never sends them to the text model); start
-# it again with: docker compose up -d imgfix
-# Config: .env next to this file (see .env.example; VISION_MODEL is required).
+# blindsight: give a text-only model "eyes", whatever API format the client speaks (Anthropic Messages, OpenAI Chat
+# Completions / Responses, Ollama) and wherever the models run (local server or hosted API).
+#   router     HAProxy (router/), the client's API address (${BIND_ADDR}:${ROUTER_PORT}). Text-only requests go
+#              straight to the text model (TEXT_URL) byte for byte; requests with an image/document/file part (or too
+#              big, compressed or otherwise unusual to check) go to imgfix; WebSocket upgrades are refused.
+#              router/entrypoint.sh checks TEXT_URL and derives HAProxy's settings.
+#   imgfix     mitmproxy addon (imgfix/imgfix.py): swaps each media part for a fixed text reference, stores the bytes
+#              in the blindsight-store volume, forwards to TEXT_URL. Internal only (no published port).
+#   vision-mcp ask_image MCP tool at ${BIND_ADDR}:${MCP_PORT}/mcp and the same as plain HTTP at .../ask (for
+#              harnesses without MCP): shows a stored image to the vision model and returns its answer. Reads
+#              blindsight-store read-only.
+# Both Python services talk to the vision model through shared/vision_api.py (VISION_API openai | anthropic), copied
+# in at build time from the named build context "shared".
+# imgfix down => the router answers media requests with a 400 (never sends them to the text model); start it again
+# with: docker compose up -d imgfix
+# Config: .env next to this file (see .env.example; VISION_MODEL is required). Every other variable has a default.
 # Start: docker compose up -d --build   Stop: docker compose down (keeps the store volume; never down -v unless you
 # want to delete every stored image)
 # Validate: docker compose config --quiet && docker compose run --rm --no-deps router haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
 # Stack test (stub models, no GPU): test/run.sh
 name: blindsight
 
+# Vision model settings, read by shared/vision_api.py in imgfix (captions) and vision-mcp (ask_image). Empty values
+# take that module's defaults (VISION_BASE_URL: per VISION_API). Meaning of each: .env.example.
+x-vision-env: &vision-env
+  VISION_API: ${VISION_API:-openai}
+  VISION_BASE_URL: ${VISION_BASE_URL:-}
+  VISION_MODEL: ${VISION_MODEL:?VISION_MODEL is not set. Copy .env.example to .env and set VISION_MODEL to the model name your vision server serves}
+  VISION_API_KEY: ${VISION_API_KEY:-}
+  VISION_HEADERS: ${VISION_HEADERS:-}
+  VISION_TOKEN_PARAM: ${VISION_TOKEN_PARAM:-}
+  VISION_EXTRA_BODY: ${VISION_EXTRA_BODY:-}
+
 services:
   router:
     image: haproxy:3.4.6-alpine@sha256:7af8255207ee9964ccb4eec8ce4b7a40b777769665e3ae83897fb01b24d8a43a
     restart: "no"
     read_only: true
+    # entrypoint.sh: TEXT_URL -> TEXT_* for haproxy.cfg (a bad value: message + exit 2), then the image's own
+    # entrypoint (haproxy -W -db). Run by sh, so the bind mount needs no exec bit. Overriding the entrypoint drops
+    # the image's CMD, hence the command.
+    entrypoint: [ "/bin/sh", "/usr/local/etc/haproxy/entrypoint.sh" ]
+    command: [ "haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg" ]
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    environment:                         # used by haproxy.cfg as "${TEXT_HOST}:${TEXT_PORT}"
-      TEXT_HOST: ${TEXT_HOST:-host.docker.internal}
-      TEXT_PORT: ${TEXT_PORT:-8000}
+      - ./router/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./router/entrypoint.sh:/usr/local/etc/haproxy/entrypoint.sh:ro
+    environment:
+      TEXT_URL: ${TEXT_URL:-http://host.docker.internal:8000}
+      TEXT_CA_FILE: ${TEXT_CA_FILE:-}    # a path inside the container: mount the PEM with a compose override
+      TEXT_HOST: ${TEXT_HOST:-}          # v1 settings, replaced by TEXT_URL: passed only so that the entrypoint
+      TEXT_PORT: ${TEXT_PORT:-}          # can refuse a v1 .env with a message naming the TEXT_URL to use
     extra_hosts: [ "host.docker.internal:host-gateway" ]   # Linux; Docker Desktop provides it anyway
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${ROUTER_PORT:-8100}:8100"
@@ -42,19 +67,27 @@ services:
 
   # Reached only by the router (imgfix:8080); no published port. Runs as uid 1000.
   imgfix:
-    build: { context: ./imgfix, target: runtime }
+    build:
+      context: ./imgfix
+      target: runtime
+      additional_contexts: { shared: ./shared }   # COPY --from=shared vision_api.py
     image: blindsight-imgfix:local
     restart: "no"
     read_only: true
-    tmpfs: [ "/tmp:size=256m" ]          # mitmproxy confdir + count_tokens PDF scratch
+    tmpfs: [ "/tmp:size=256m" ]          # mitmproxy confdir + count-only PDF scratch
     volumes:
       - blindsight-store:/store          # first mount of a fresh volume copies the image's 1000:1000 /store
     environment:
-      TEXT_UPSTREAM: http://${TEXT_HOST:-host.docker.internal}:${TEXT_PORT:-8000}
-      VISION_BASE_URL: ${VISION_BASE_URL:-http://host.docker.internal:8001/v1}
-      VISION_MODEL: ${VISION_MODEL:?VISION_MODEL is not set. Copy .env.example to .env and set VISION_MODEL to the model name your vision server serves}
-      VISION_API_KEY: ${VISION_API_KEY:-}
-      VISION_EXTRA_BODY: ${VISION_EXTRA_BODY:-}
+      <<: *vision-env
+      TEXT_URL: ${TEXT_URL:-http://host.docker.internal:8000}
+      TEXT_CA_FILE: ${TEXT_CA_FILE:-}
+      PASSTHROUGH_MODELS: ${PASSTHROUGH_MODELS:-}
+      CAPTION_MODE: ${CAPTION_MODE:-short}
+      CAPTION_TIMEOUT: ${CAPTION_TIMEOUT:-}      # empty: the mode's default (short 8 s, detailed 45 s)
+      ASK_HINT: ${ASK_HINT:-mcp}
+      ASK_URL: ${ASK_URL:-http://127.0.0.1:${MCP_PORT:-8102}/ask}
+      FETCH_REMOTE_IMAGES: ${FETCH_REMOTE_IMAGES:-false}
+      FETCH_ALLOW_PRIVATE: ${FETCH_ALLOW_PRIVATE:-false}
       IMGFIX_STORE: /store
       IMGFIX_MIN_FREE_GB: ${IMGFIX_MIN_FREE_GB:-5}   # below this much free disk, new images/PDFs become "unavailable"
     extra_hosts: [ "host.docker.internal:host-gateway" ]
@@ -71,9 +104,13 @@ services:
       retries: 3
       start_period: 10s
 
-  # ask_image MCP server: streamable HTTP at :8102/mcp. Runs as uid 10001.
+  # ask_image: MCP (streamable HTTP) at :8102/mcp, plain HTTP at :8102/ask (GET query or POST JSON/form).
+  # Runs as uid 10001.
   vision-mcp:
-    build: { context: ./vision-mcp, target: runtime }
+    build:
+      context: ./vision-mcp
+      target: runtime
+      additional_contexts: { shared: ./shared }   # COPY --from=shared vision_api.py
     image: blindsight-vision-mcp:local
     restart: "no"
     read_only: true
@@ -81,12 +118,9 @@ services:
     volumes:
       - blindsight-store:/store:ro
     environment:
+      <<: *vision-env
       STORE_DIR: /store
-      VISION_BASE_URL: ${VISION_BASE_URL:-http://host.docker.internal:8001/v1}
-      VISION_MODEL: ${VISION_MODEL:?VISION_MODEL is not set. Copy .env.example to .env and set VISION_MODEL to the model name your vision server serves}
-      VISION_API_KEY: ${VISION_API_KEY:-}
-      VISION_EXTRA_BODY: ${VISION_EXTRA_BODY:-}
-      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,vision-mcp:*}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,vision-mcp:*}   # /mcp and /ask
     extra_hosts: [ "host.docker.internal:host-gateway" ]
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${MCP_PORT:-8102}:8102"

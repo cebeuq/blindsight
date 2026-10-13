@@ -1,17 +1,38 @@
-# Stack test overlay (never deploy). Run via test/run.sh: project blindsight-test, every variable set there.
+# Stack test overlay (never deploy). Run via test/run.sh: project blindsight-test (or TEST_PROJECT), every variable
+# set there.
 # The blindsight network becomes INTERNAL (no outside access) and gains a stub that plays both models: the text model
-# on stub:8000 and the vision model on stub:8001 (run.sh points TEXT_HOST / VISION_BASE_URL at it). Nothing is
-# published on the host, and the images get test-only tags so a deployed stack's images are never replaced.
+# on stub:8000 (http) and stub:8443 (https, certificate from a throwaway test CA) and the vision model on stub:8001
+# (run.sh points TEXT_URL / VISION_BASE_URL at it). Nothing is published on the host, and the images get test-only
+# tags (<project>-imgfix:local, <project>-vision-mcp:local) so a deployed stack's images are never replaced.
+# TLS material: certgen (run once by run.sh, before "up") writes ca.pem / server.pem / server.key into the test-only
+# "tls" volume; the stub serves with them and router + imgfix trust ca.pem via TEXT_CA_FILE=/tls/ca.pem (the way a
+# user mounts a private CA with a compose override).
 # Paths are relative to the project directory (the repo root, i.e. the first -f file).
 services:
   router:
     ports: !reset []
-    depends_on: { stub: { condition: service_healthy } }   # HAProxy resolves TEXT_HOST=stub once, at startup
+    volumes: [ "tls:/tls:ro" ]
+    depends_on: { stub: { condition: service_healthy } }   # HAProxy resolves the TEXT_URL host at startup
   imgfix:
-    image: blindsight-test-imgfix:local
+    image: ${COMPOSE_PROJECT_NAME}-imgfix:local
+    volumes: [ "tls:/tls:ro" ]
   vision-mcp:
-    image: blindsight-test-vision-mcp:local
+    image: ${COMPOSE_PROJECT_NAME}-vision-mcp:local
     ports: !reset []
+
+  # One-shot: test CA + server certificate for "stub" (test/certgen.py; cryptography comes with mitmproxy). Mounts the
+  # fresh tls volume at /store, the image's only directory owned by its uid 1000, so the volume inherits that owner
+  # and certgen needs no root. The files are world-readable (the stub runs as nobody): test-only material.
+  certgen:
+    image: ${COMPOSE_PROJECT_NAME}-imgfix:local     # built by the imgfix service
+    profiles: [ tools ]
+    restart: "no"
+    read_only: true
+    network_mode: none
+    entrypoint: [ python3, -I, /test/certgen.py, /store, stub ]
+    volumes: [ "./test/certgen.py:/test/certgen.py:ro", "tls:/store" ]
+    mem_limit: 256m
+    pids_limit: 32
 
   stub:
     image: python:3.14.8-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
@@ -19,30 +40,45 @@ services:
     read_only: true
     user: "65534:65534"
     command: [ python, -I, /test/stub.py ]
-    volumes: [ "./test/stub.py:/test/stub.py:ro" ]
-    networks: [ blindsight ]
+    volumes: [ "./test/stub.py:/test/stub.py:ro", "tls:/tls:ro" ]
+    networks:
+      blindsight:
+        aliases: [ stub-wrongname ]                 # a name the certificate does not carry (bad-TLS routers)
     mem_limit: 512m                                 # holds one ~34 MiB recorded body (big-body check)
     cpus: 1
     pids_limit: 64
     stop_grace_period: 5s
     logging: { driver: local, options: { max-size: "20m", max-file: "3" } }
     healthcheck:
-      test: [ "CMD", "python", "-c", "import urllib.request as u; [u.urlopen(f'http://127.0.0.1:{p}/health', timeout=2) for p in (8000, 8001)]" ]
+      test: [ "CMD", "python", "-c", "import socket, urllib.request as u; [u.urlopen(f'http://127.0.0.1:{p}/health', timeout=2) for p in (8000, 8001)]; socket.create_connection(('127.0.0.1', 8443), 2).close()" ]
       interval: 2s
       timeout: 3s
       retries: 10
 
   driver:
-    image: blindsight-test-vision-mcp:local         # built by the vision-mcp service; has Pillow
+    image: ${COMPOSE_PROJECT_NAME}-vision-mcp:local # built by the vision-mcp service; has Pillow
     profiles: [ driver ]
     restart: "no"
     read_only: true
     command: [ python, -I, /test/driver.py, phase1 ]
-    environment:                                    # what the driver expects the services to send to the stub
+    environment:                                    # the configuration under test: what the driver expects to see
+      TEXT_URL: ${TEXT_URL:?run via test/run.sh}
+      PASSTHROUGH_MODELS: ${PASSTHROUGH_MODELS:-}
+      CAPTION_MODE: ${CAPTION_MODE:?run via test/run.sh}
+      ASK_HINT: ${ASK_HINT:?run via test/run.sh}
+      ASK_URL: ${ASK_URL:-http://127.0.0.1:${MCP_PORT:-8102}/ask}
+      FETCH_REMOTE_IMAGES: ${FETCH_REMOTE_IMAGES:?run via test/run.sh}
+      VISION_API: ${VISION_API:?run via test/run.sh}
       VISION_MODEL: ${VISION_MODEL:?run via test/run.sh}
       VISION_API_KEY: ${VISION_API_KEY:?run via test/run.sh}
+      VISION_HEADERS: ${VISION_HEADERS:-}
+      VISION_TOKEN_PARAM: ${VISION_TOKEN_PARAM:-}
       VISION_EXTRA_BODY: ${VISION_EXTRA_BODY:?run via test/run.sh}
-    volumes: [ "./test/driver.py:/test/driver.py:ro" ]
+      CLIENT_API_KEY: ${CLIENT_API_KEY:?run via test/run.sh}   # the driver's own API key (must never be logged)
+      BADTLS_ROUTERS: ${BADTLS_ROUTERS:-}           # set per run by run.sh for the badtls phase
+    volumes:
+      - ./test/driver.py:/test/driver.py:ro
+      - blindsight-store:/store:ro                  # checks what was (not) written
     networks: [ blindsight ]
     mem_limit: 512m
     cpus: 1
@@ -51,3 +87,6 @@ services:
 networks:
   blindsight:
     internal: true
+
+volumes:
+  tls: {}                                           # test CA material: blindsight-test_tls, removed by run.sh

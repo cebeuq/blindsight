@@ -1,0 +1,57 @@
+# TEXT_URL parity table (test/run.sh): router/entrypoint.sh and imgfix must accept/reject each line the same way and
+# derive the same scheme, host, port and path prefix. One URL per line; "#" lines are comments; an empty line is the
+# empty value (the default URL).
+
+http://host.docker.internal:8000
+https://api.deepseek.com/anthropic
+https://openrouter.ai/api/
+https://api.groq.com/openai
+https://api.moonshot.ai/anthropic
+https://api.z.ai/api/anthropic
+HTTPS://API.Groq.com:443/openai//
+Http://Stub:8000
+  http://stub:8000  
+http://stub:8443/pfx
+http://host:
+http://h:08000/a
+http://10.0.0.5:080/x%20y
+http://h/a/b/c/
+http://h/A-z_0.9~!$&'()*+,;=:@/x
+http://[::1]:8000
+http://[FD00::1]/v1
+http://[::ffff:1.2.3.4]:80
+http://h_1.internal:8000
+http://localhost:11434
+ftp://x
+api.example.com
+//api.example.com
+http:/x
+https://u:p@api.example.com
+https://@api.example.com
+https://api.example.com/?k=1
+https://api.example.com/v1?
+https://api.example.com/#f
+http://:80
+http://ex_ample..com
+http://-bad.example
+http://h.example.
+http://999.1.1.1
+http://010.0.0.1
+http://1.2.3
+http://[::1
+http://[::1]x
+http://[fe80::1%25eth0]:80
+http://[g::1]/
+http://::1:80
+http://x:80:90
+http://h:0
+http://h:65535
+http://h:65536
+http://h:x
+http://h/a%zz
+http://h/a%2
+http://h/a"b
+http://h/a{b}
+http://h/a b
+https://10.1.2.3
+https://[2001:db8::1]/v1

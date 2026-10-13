@@ -1,13 +1,17 @@
 # vision-mcp dev tasks. NOT the deployment (the top-level compose.yaml owns the vision-mcp service).
 # Paths below are relative to this directory; from the repo root add -f vision-mcp/compose.dev.yaml.
-#   Tests:  docker compose -f compose.dev.yaml run --rm --build test     (no network: the vision model is a local stub)
+#   Tests:  docker compose -f compose.dev.yaml run --rm --build test     (no network: the vision model is a local stub;
+#           includes shared/tests, the vision_api unit tests)
 #   Relock: docker compose -f compose.dev.yaml run --rm lock             (requirements.in -> hashed requirements.txt)
 #   Smoke:  docker compose -f compose.dev.yaml up -d --build serve        (runtime image on 127.0.0.1:8102, empty tmpfs
-#           store, vision model unreachable unless VISION_BASE_URL is set) ... docker compose -f compose.dev.yaml down
+#           store, vision model unreachable unless VISION_BASE_URL is set; VISION_* pass through from the shell)
+#           ... docker compose -f compose.dev.yaml down
+#   Clean:  docker image rm blindsight-vision-mcp:test blindsight-vision-mcp:dev
+# Both builds need the named context "shared" (../shared: vision_api.py, shared by imgfix and vision-mcp).
 name: blindsight-vision-mcp-dev
 services:
   test:
-    build: { context: ., target: test }
+    build: { context: ., target: test, additional_contexts: { shared: ../shared } }
     image: blindsight-vision-mcp:test
     restart: "no"
     network_mode: none
@@ -17,14 +21,19 @@ services:
     cpus: 2
     pids_limit: 256
   serve:
-    build: { context: ., target: runtime }
+    build: { context: ., target: runtime, additional_contexts: { shared: ../shared } }
     image: blindsight-vision-mcp:dev
     restart: "no"
     read_only: true
     tmpfs: [ /tmp, /store ]
     environment:
+      VISION_API: "${VISION_API:-}"
       VISION_BASE_URL: "${VISION_BASE_URL:-http://127.0.0.1:9}"
       VISION_MODEL: "${VISION_MODEL:-dev-placeholder}"
+      VISION_API_KEY: "${VISION_API_KEY:-}"
+      VISION_HEADERS: "${VISION_HEADERS:-}"
+      VISION_TOKEN_PARAM: "${VISION_TOKEN_PARAM:-}"
+      VISION_EXTRA_BODY: "${VISION_EXTRA_BODY:-}"
     ports: [ "127.0.0.1:8102:8102" ]
     mem_limit: 1536m
     cpus: 2
