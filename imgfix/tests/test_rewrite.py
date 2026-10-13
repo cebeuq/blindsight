@@ -477,6 +477,37 @@ class RewriteTest(unittest.TestCase):
         self.assertTrue(imgfix.clean_caption(" ".join(["w"] * 50)).endswith("..."))
         self.assertEqual(imgfix.clean_caption(None), "")
 
+    def test_clean_caption_reasoning(self):
+        # Reasoning without an opening tag (chat template put <think> in the prompt): keep what follows </think>.
+        self.assertEqual(imgfix.clean_caption("Hmm, describe it.\n</think>\n\nA red box on white."),
+                         "A red box on white.")
+        self.assertEqual(imgfix.clean_caption("<think>a</think>x<think>b</think> A dog."), "A dog.")
+        # Unclosed (cut-off) reasoning block is never a caption.
+        self.assertEqual(imgfix.clean_caption("<think>Okay, the user wants a one-sentence description"), "")
+        self.assertEqual(imgfix.clean_caption("A cat. <think>more"), "A cat.")
+
+    def test_captioner_length_cutoff(self):
+        import httpx
+
+        def run(choice):
+            cap = imgfix.VisionCaptioner("http://q:1", model="vision-x", extra={})
+            cap.client = httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda req: httpx.Response(200, json={"choices": [choice]})))
+
+            async def go():
+                try:
+                    return await cap(h.png(20, 10))
+                finally:
+                    await cap.aclose()
+            return asyncio.run(go())
+
+        # Cut off at max_tokens (e.g. a thinking model mid-reasoning): no caption rather than a wrong one for good.
+        self.assertEqual(run({"finish_reason": "length", "message": {
+            "content": "Okay, the user wants a one-sentence description. Let me look at the image: it shows a red"}}),
+            "")
+        self.assertEqual(run({"finish_reason": "stop", "message": {"content": "A red box."}}), "A red box.")
+        self.assertEqual(run({"message": {"content": None}}), "")
+
     def test_vision_png_downscale(self):
         for raw, size in ((h.png(4000, 1000), (1600, 400)), (h.png(300, 200), (300, 200)),
                           (h.jpeg_cmyk(3200, 1600), (1600, 800))):

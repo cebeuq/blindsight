@@ -160,8 +160,13 @@ def url_text(kind, url):
 
 
 def clean_caption(s):
-    """One line, no placeholder delimiters, bounded length (the caption lands inside [... | ... | caption])."""
-    s = re.sub(r"<think>.*?</think>", "", s or "", flags=re.S)
+    """One line, no placeholder delimiters, bounded length (the caption lands inside [... | ... | caption]).
+    A reasoning model may emit its thinking first: keep only what follows the last </think>, and drop an unclosed
+    <think> block (cut-off reasoning is never a caption; captions are stored for good)."""
+    s = s or ""
+    if "</think>" in s:
+        s = s.rsplit("</think>", 1)[1]
+    s = s.split("<think>", 1)[0]
     s = " ".join(s.split()).translate({ord("["): "(", ord("]"): ")", ord("|"): "/"}).strip(" \"'")
     words = s.split(" ")
     if len(words) > 30:
@@ -703,7 +708,14 @@ class VisionCaptioner:
         body = await asyncio.to_thread(_caption_request, raw, self.model, self.extra)  # resize + base64 off the loop
         r = await self.client.post(self.url, content=body, headers=self.headers)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"] or ""
+        choice = r.json()["choices"][0]
+        if choice.get("finish_reason") == "length":
+            # A <=20-word sentence fits easily in max_tokens, so a cut-off reply is reasoning or rambling (e.g. a
+            # thinking model without VISION_EXTRA_BODY turning thinking off). No caption beats a wrong one for good.
+            log.info("imgfix: caption cut off at max_tokens; stored without caption "
+                     "(thinking model? see VISION_EXTRA_BODY)")
+            return ""
+        return choice["message"]["content"] or ""
 
     async def aclose(self):
         if self.client is not None:
